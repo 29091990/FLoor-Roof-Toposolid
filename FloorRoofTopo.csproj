@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RevitVersion Condition="'$(RevitVersion)' == ''">2024</RevitVersion>
+    <RootNamespace>FloorRoofTopo</RootNamespace>
+    <AssemblyName>FloorRoofTopo</AssemblyName>
+    <UseWPF>true</UseWPF>
+    <OutputPath>bin\Revit$(RevitVersion)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <!-- Revit 2020-2024: .NET Framework 4.8 -->
+  <PropertyGroup Condition="'$(RevitVersion)' &lt;= '2024'">
+    <TargetFramework>net48</TargetFramework>
+  </PropertyGroup>
+
+  <!-- Revit 2025-2026: .NET 8.0 -->
+  <PropertyGroup Condition="'$(RevitVersion)' &gt;= '2025'">
+    <TargetFramework>net8.0-windows</TargetFramework>
+  </PropertyGroup>
+
+  <!-- Conditional defines: REVIT_LEGACY for 2020-2021 (uses NewFloor API) -->
+  <PropertyGroup Condition="'$(RevitVersion)' &lt;= '2021'">
+    <DefineConstants>$(DefineConstants);REVIT_LEGACY</DefineConstants>
+  </PropertyGroup>
+
+  <!-- Conditional defines: REVIT2024_PLUS for 2024+ (has TopoSolid) -->
+  <PropertyGroup Condition="'$(RevitVersion)' &gt;= '2024'">
+    <DefineConstants>$(DefineConstants);REVIT2024_PLUS</DefineConstants>
+  </PropertyGroup>
+
+  <!-- Revit API References -->
+  <ItemGroup>
+    <Reference Include="RevitAPI">
+      <HintPath>C:\Program Files\Autodesk\Revit $(RevitVersion)\RevitAPI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="RevitAPIUI">
+      <HintPath>C:\Program Files\Autodesk\Revit $(RevitVersion)\RevitAPIUI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- .NET Framework reference assemblies (for dotnet build with net48) -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+</Project>

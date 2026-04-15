@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Floor Roof Topo Converter</Name>
+    <FullClassName>FloorRoofTopo.App</FullClassName>
+    <Assembly>FloorRoofTopo.dll</Assembly>
+    <AddInId>B3F7A2E1-9C4D-4E8B-A5F0-1D2E3F4A5B6C</AddInId>
+    <VendorId>FloorRoofTopo</VendorId>
+    <VendorDescription>Floor Roof Topo Converter Add-in</VendorDescription>
+  </AddIn>
+</RevitAddIns>
