@@ -30,6 +30,11 @@
     <DefineConstants>$(DefineConstants);REVIT2024_PLUS</DefineConstants>
   </PropertyGroup>
 
+  <!-- Conditional defines: REVIT2026 for 2026+ (DrawPoint removed, uses AddPoint) -->
+  <PropertyGroup Condition="'$(RevitVersion)' &gt;= '2026'">
+    <DefineConstants>$(DefineConstants);REVIT2026</DefineConstants>
+  </PropertyGroup>
+
   <!-- Revit API References -->
   <ItemGroup>
     <Reference Include="RevitAPI">

@@ -27,6 +27,14 @@ namespace FloorRoofTopo
         public string ErrorMessage { get; set; }
         public string WarningMessage { get; set; }
         public ConversionDiagnosticInfo Diagnostics { get; set; }
+
+        // ── Pending shape editing (applied in a separate transaction) ──
+        // On Revit 2026+, SlabShapeEditor.Enable() fails within the same
+        // transaction that created the element. Shape data is stored here
+        // and applied after the creation transaction is committed.
+        public bool HasPendingShapeEditing { get; set; }
+        public List<ShapePointData> PendingShapeData { get; set; }
+        public double PendingShapeBaseZ { get; set; }
     }
 
     /// <summary>
@@ -43,6 +51,7 @@ namespace FloorRoofTopo
         public double RelativeZ { get; set; }
         public double TargetZ { get; set; }
         public bool Applied { get; set; }
+        public string ErrorInfo { get; set; }
     }
 
     /// <summary>
@@ -64,6 +73,7 @@ namespace FloorRoofTopo
         public int TotalCurves { get; set; }
         public List<ShapePointData> ShapePoints { get; set; } = new List<ShapePointData>();
         public int AppliedCount { get; set; }
+        public string EditorMethods { get; set; }
         public bool Success { get; set; }
         public string Message { get; set; }
     }
@@ -252,20 +262,204 @@ namespace FloorRoofTopo
             return result;
         }
 
+        /// <summary>
+        /// Subdivide boundary curves at edge vertex positions from source shape data.
+        ///
+        /// Problem: SlabShapeEditor can only modify existing boundary vertices or
+        /// add interior points. It CANNOT add new points ON boundary edges.
+        /// When a TopoSolid has edge vertices (subdivision points along its boundary),
+        /// these cannot be transferred to a Floor/Roof because the target boundary
+        /// has only corner vertices.
+        ///
+        /// Solution: Before creating the target element, split each boundary line
+        /// segment at positions where source edge vertices exist. This creates
+        /// additional corner vertices in the target, allowing shape editing to
+        /// modify them via ModifySubElement.
+        /// </summary>
+        public static IList<CurveLoop> SubdivideBoundaryAtEdgePoints(
+            IList<CurveLoop> boundary, List<ShapePointData> shapeData)
+        {
+            if (boundary == null || shapeData == null) return boundary;
+
+            // Collect edge-type points (XY only)
+            var edgePoints = shapeData
+                .Where(sp => sp.VertexType == "Edge" || sp.VertexType == "Cạnh")
+                .ToList();
+
+            if (edgePoints.Count == 0) return boundary;
+
+            var result = new List<CurveLoop>();
+
+            foreach (CurveLoop loop in boundary)
+            {
+                CurveLoop newLoop = new CurveLoop();
+
+                foreach (Curve curve in loop)
+                {
+                    XYZ start = curve.GetEndPoint(0);
+                    XYZ end = curve.GetEndPoint(1);
+
+                    if (curve is Line)
+                    {
+                        // Find edge points that project onto this line segment
+                        double segLen = Math.Sqrt(
+                            Math.Pow(end.X - start.X, 2) +
+                            Math.Pow(end.Y - start.Y, 2));
+
+                        if (segLen < 1e-6)
+                        {
+                            newLoop.Append(curve);
+                            continue;
+                        }
+
+                        double dirX = (end.X - start.X) / segLen;
+                        double dirY = (end.Y - start.Y) / segLen;
+
+                        // Collect (parameter, edgePoint) pairs for points on this line
+                        var splits = new List<Tuple<double, ShapePointData>>();
+
+                        foreach (var ep in edgePoints)
+                        {
+                            // Project edge point onto line (2D)
+                            double vx = ep.X - start.X;
+                            double vy = ep.Y - start.Y;
+                            double t = vx * dirX + vy * dirY; // dot product
+
+                            // Must be interior to the segment (not at endpoints)
+                            if (t < 0.005 || t > segLen - 0.005) continue;
+
+                            // Perpendicular distance
+                            double projX = start.X + t * dirX;
+                            double projY = start.Y + t * dirY;
+                            double perpDist = Math.Sqrt(
+                                Math.Pow(ep.X - projX, 2) +
+                                Math.Pow(ep.Y - projY, 2));
+
+                            if (perpDist < 0.01) // ~3mm tolerance
+                            {
+                                splits.Add(Tuple.Create(t, ep));
+                            }
+                        }
+
+                        if (splits.Count == 0)
+                        {
+                            newLoop.Append(curve);
+                            continue;
+                        }
+
+                        // Sort by parameter along the line
+                        splits.Sort((a, b) => a.Item1.CompareTo(b.Item1));
+
+                        // Split the line at each edge point
+                        XYZ prev = start;
+                        foreach (var split in splits)
+                        {
+                            // Use exact XY from edge point, Z from boundary
+                            XYZ splitPt = new XYZ(split.Item2.X, split.Item2.Y, start.Z);
+
+                            if (Math.Sqrt(
+                                Math.Pow(prev.X - splitPt.X, 2) +
+                                Math.Pow(prev.Y - splitPt.Y, 2)) > 1e-6)
+                            {
+                                newLoop.Append(Line.CreateBound(prev, splitPt));
+                                prev = splitPt;
+                            }
+                        }
+
+                        // Final segment to end
+                        if (Math.Sqrt(
+                            Math.Pow(prev.X - end.X, 2) +
+                            Math.Pow(prev.Y - end.Y, 2)) > 1e-6)
+                        {
+                            newLoop.Append(Line.CreateBound(prev, end));
+                        }
+                    }
+                    else
+                    {
+                        // For arcs/other curves, keep as-is
+                        newLoop.Append(curve);
+                    }
+                }
+
+                if (newLoop.Count() > 0)
+                    result.Add(newLoop);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Ensure the outer CurveLoop is counter-clockwise (required by Floor.Create).
+        /// Inner loops (holes) should be clockwise.
+        /// Floor.Create throws when loop orientation is wrong.
+        /// </summary>
+        public static IList<CurveLoop> EnsureCorrectOrientation(IList<CurveLoop> loops)
+        {
+            if (loops == null || loops.Count == 0) return loops;
+
+            var result = new List<CurveLoop>();
+
+            for (int i = 0; i < loops.Count; i++)
+            {
+                CurveLoop loop = loops[i];
+                bool isCounterClockwise = loop.IsCounterclockwise(
+                    new XYZ(0, 0, 1));
+
+                if (i == 0)
+                {
+                    // Outer loop must be counter-clockwise
+                    if (!isCounterClockwise)
+                    {
+                        loop.Flip();
+                    }
+                }
+                else
+                {
+                    // Inner loops (holes) must be clockwise
+                    if (isCounterClockwise)
+                    {
+                        loop.Flip();
+                    }
+                }
+
+                result.Add(loop);
+            }
+
+            return result;
+        }
+
         // ================================================================
         //  SLABSHAPEEDITOR HELPERS (Reflection-based cross-version)
         // ================================================================
 
         /// <summary>
-        /// Get SlabShapeEditor from element using reflection.
-        /// Revit 2024+: method GetSlabShapeEditor()
-        /// Revit 2019-2023: property SlabShapeEditor
+        /// Get SlabShapeEditor from element.
+        /// Revit 2024+: direct cast or method GetSlabShapeEditor()
+        /// Revit 2019-2023: property SlabShapeEditor (reflection)
+        /// IMPORTANT: Always call this to get a FRESH editor reference.
+        /// On Revit 2026+, stale references may not reflect Enable() state.
         /// </summary>
         public static SlabShapeEditor GetEditor(Element element)
         {
             if (element == null) return null;
 
-            // Try method GetSlabShapeEditor() first (Revit 2024+)
+#if REVIT2024_PLUS
+            // Direct API calls — avoids reflection issues on .NET 8 (Revit 2025+)
+            try
+            {
+                if (element is Floor floor)
+                    return floor.GetSlabShapeEditor();
+            }
+            catch { }
+            try
+            {
+                if (element is FootPrintRoof roof)
+                    return roof.GetSlabShapeEditor();
+            }
+            catch { }
+#endif
+
+            // Reflection fallback for older versions or unexpected types
             try
             {
                 var method = element.GetType().GetMethod("GetSlabShapeEditor",
@@ -276,7 +470,6 @@ namespace FloorRoofTopo
             }
             catch { }
 
-            // Fallback: property SlabShapeEditor (Revit 2019-2023)
             try
             {
                 var prop = element.GetType().GetProperty("SlabShapeEditor",
@@ -346,43 +539,66 @@ namespace FloorRoofTopo
             return applied;
         }
 
+        // ── Thread-local error capture for diagnostics ────────────────
+        [ThreadStatic] private static string _lastPointError;
+
         /// <summary>
-        /// Add a point to SlabShapeEditor with cross-version reflection.
-        /// Revit 2026+: AddPoint(XYZ), Revit 2019-2025: DrawPoint(XYZ).
+        /// Add or modify a point on SlabShapeEditor.
+        /// Revit 2020-2025: DrawPoint(XYZ) — Z must be ON the slab face.
+        /// Revit 2026+: DrawPoint removed, use AddPoint(XYZ) instead.
         /// </summary>
         private static bool AddPointSafe(SlabShapeEditor editor, XYZ point)
         {
             if (editor == null || point == null) return false;
-
-            // 1. Try AddPoint first (Revit 2026+)
             try
             {
-                var method = editor.GetType().GetMethod("AddPoint",
-                    BindingFlags.Public | BindingFlags.Instance,
-                    null, new Type[] { typeof(XYZ) }, null);
-                if (method != null)
-                {
-                    method.Invoke(editor, new object[] { point });
-                    return true;
-                }
+#if REVIT2026
+                editor.AddPoint(point);
+#else
+                editor.DrawPoint(point);
+#endif
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _lastPointError = $"DrawPoint/AddPoint: {ex.Message}";
+                return false;
+            }
+        }
 
-            // 2. Fallback: DrawPoint (Revit 2019-2025)
+        /// <summary>
+        /// Modify an existing SlabShapeVertex's height offset.
+        /// ModifySubElement(SlabShapeVertex, double) exists in ALL Revit versions.
+        /// The offset is the elevation relative to the original unedited slab plane.
+        /// </summary>
+        private static bool ModifyVertexSafe(SlabShapeEditor editor, SlabShapeVertex vertex, double offset)
+        {
+            if (editor == null || vertex == null) return false;
             try
             {
-                var method = editor.GetType().GetMethod("DrawPoint",
-                    BindingFlags.Public | BindingFlags.Instance,
-                    null, new Type[] { typeof(XYZ) }, null);
-                if (method != null)
-                {
-                    method.Invoke(editor, new object[] { point });
-                    return true;
-                }
+                editor.ModifySubElement(vertex, offset);
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _lastPointError = $"ModifySubElement: {ex.Message}";
+                return false;
+            }
+        }
 
-            return false;
+        /// <summary>
+        /// Get a summary of editor state for diagnostics.
+        /// </summary>
+        private static string GetEditorMethodsSummary(SlabShapeEditor editor)
+        {
+            if (editor == null) return "Editor is null";
+            try
+            {
+                int vtxCount = 0;
+                try { vtxCount = editor.SlabShapeVertices.Size; } catch { }
+                return $"Enabled={editor.IsEnabled}; Vertices={vtxCount}";
+            }
+            catch { return "Error reading editor"; }
         }
 
         // ================================================================
@@ -391,10 +607,12 @@ namespace FloorRoofTopo
 
         /// <summary>
         /// Create a Floor element from boundary CurveLoops.
+        /// Handles orientation enforcement and fallback strategies for
+        /// boundaries from TopoSolid/Roof that may have incompatible winding.
         /// </summary>
         public static Floor CreateFloor(Document doc, IList<CurveLoop> boundary, ElementId levelId)
         {
-            ElementId typeId = GetDefaultTypeId(doc, typeof(FloorType));
+            ElementId typeId = FindFloorTypeId(doc);
             if (typeId == null || typeId == ElementId.InvalidElementId)
                 throw new InvalidOperationException("Không tìm thấy Floor Type trong project.");
 
@@ -409,7 +627,90 @@ namespace FloorRoofTopo
             return doc.Create.NewFloor(curveArray, floorType, level, false);
 #else
             // Revit 2022+: use Floor.Create
-            return Floor.Create(doc, flatBoundary, typeId, levelId);
+            // Floor.Create is strict about loop orientation:
+            //   - Outer loop must be counter-clockwise
+            //   - Inner loops (holes) must be clockwise
+            // TopoSolid/Roof boundaries may have the wrong winding.
+
+            // Attempt 1: with corrected orientation
+            try
+            {
+                IList<CurveLoop> oriented = EnsureCorrectOrientation(flatBoundary);
+                return Floor.Create(doc, oriented, typeId, levelId);
+            }
+            catch { }
+
+            // Attempt 2: use only the outer loop (skip problematic inner loops)
+            try
+            {
+                // Find the largest loop by area (= outer boundary)
+                CurveLoop outerLoop = null;
+                double maxArea = 0;
+                foreach (var loop in flatBoundary)
+                {
+                    try
+                    {
+                        // Approximate area using shoelace on endpoints
+                        double area = Math.Abs(GetLoopArea(loop));
+                        if (area > maxArea)
+                        {
+                            maxArea = area;
+                            outerLoop = loop;
+                        }
+                    }
+                    catch { if (outerLoop == null) outerLoop = loop; }
+                }
+
+                if (outerLoop != null)
+                {
+                    // Ensure CCW
+                    try
+                    {
+                        if (!outerLoop.IsCounterclockwise(new XYZ(0, 0, 1)))
+                            outerLoop.Flip();
+                    }
+                    catch { }
+
+                    var singleLoop = new List<CurveLoop> { outerLoop };
+                    return Floor.Create(doc, singleLoop, typeId, levelId);
+                }
+            }
+            catch { }
+
+            // Attempt 3: try flipped orientation (some TopoSolids have reversed normals)
+            try
+            {
+                foreach (var loop in flatBoundary)
+                {
+                    loop.Flip();
+                }
+                return Floor.Create(doc, flatBoundary, typeId, levelId);
+            }
+            catch { }
+
+            // Attempt 4: last resort — NewFloor via reflection (more tolerant, deprecated API)
+            try
+            {
+                CurveArray curveArray = CurveLoopToCurveArray(flatBoundary[0]);
+                FloorType floorType = doc.GetElement(typeId) as FloorType;
+                var createObj = doc.Create;
+                var newFloorMethod = createObj.GetType().GetMethod("NewFloor",
+                    BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    new Type[] { typeof(CurveArray), typeof(FloorType), typeof(Level), typeof(bool) },
+                    null);
+                if (newFloorMethod != null)
+                {
+                    var result = newFloorMethod.Invoke(createObj,
+                        new object[] { curveArray, floorType, level, false }) as Floor;
+                    if (result != null) return result;
+                }
+            }
+            catch { }
+
+            throw new InvalidOperationException(
+                "Không thể tạo Floor. Boundary có thể không hợp lệ — " +
+                "kiểm tra đường biên nguồn có đóng kín và không tự giao cắt.");
 #endif
         }
 
@@ -454,16 +755,20 @@ namespace FloorRoofTopo
         /// </summary>
         public static Toposolid CreateTopoSolid(Document doc, IList<CurveLoop> boundary, ElementId levelId)
         {
-            return CreateTopoSolid(doc, boundary, levelId, null);
+            return CreateTopoSolid(doc, boundary, levelId, null, null);
         }
 
         /// <summary>
         /// Create a Toposolid with optional interior shape points (Revit 2024+).
         /// If interiorPoints is provided, tries to use Toposolid.Create(doc, boundary, points, typeId, levelId)
         /// which directly defines the surface shape — more reliable than using SlabShapeEditor afterward.
+        /// 
+        /// surfaceElevation: the Z to flatten boundary curves to. If null, uses level elevation.
+        /// CRITICAL for Floor/Roof→Topo conversion when source has Height Offset:
+        ///   TopoSolid has no offset parameter, so boundary must be at sourceBaseZ.
         /// </summary>
         public static Toposolid CreateTopoSolid(Document doc, IList<CurveLoop> boundary, ElementId levelId,
-            IList<XYZ> interiorPoints)
+            IList<XYZ> interiorPoints, double? surfaceElevation = null)
         {
             ElementId typeId = FindToposolidTypeId(doc);
             if (typeId == null || typeId == ElementId.InvalidElementId)
@@ -473,7 +778,9 @@ namespace FloorRoofTopo
 
             Level level = doc.GetElement(levelId) as Level;
             double levelZ = level?.Elevation ?? 0;
-            IList<CurveLoop> flatBoundary = FlattenToZ(boundary, levelZ);
+            // Use surfaceElevation if provided (bakes source offset into boundary)
+            double flatZ = surfaceElevation ?? levelZ;
+            IList<CurveLoop> flatBoundary = FlattenToZ(boundary, flatZ);
 
             // Try the overload with interior points first
             if (interiorPoints != null && interiorPoints.Count > 0)
@@ -553,6 +860,23 @@ namespace FloorRoofTopo
         }
 
         /// <summary>
+        /// Calculate signed area of a CurveLoop using the Shoelace formula.
+        /// Positive = counter-clockwise, Negative = clockwise.
+        /// Used to identify the outer loop (largest area) and check winding.
+        /// </summary>
+        private static double GetLoopArea(CurveLoop loop)
+        {
+            double area = 0;
+            foreach (Curve curve in loop)
+            {
+                XYZ p0 = curve.GetEndPoint(0);
+                XYZ p1 = curve.GetEndPoint(1);
+                area += (p0.X * p1.Y - p1.X * p0.Y);
+            }
+            return area / 2.0;
+        }
+
+        /// <summary>
         /// Get the default ElementType ID for a given type class.
         /// </summary>
         public static ElementId GetDefaultTypeId(Document doc, Type typeClass)
@@ -561,6 +885,74 @@ namespace FloorRoofTopo
                 .OfClass(typeClass);
             Element first = collector.FirstOrDefault();
             return first?.Id ?? ElementId.InvalidElementId;
+        }
+
+        /// <summary>
+        /// Find a regular Floor type, excluding Structural Foundation types.
+        /// Foundation Slab (OST_StructuralFoundation) does NOT support
+        /// SlabShapeEditor — must pick a real Floor (OST_Floors).
+        /// Priority: "Generic" > any non-foundation > first available.
+        /// </summary>
+        public static ElementId FindFloorTypeId(Document doc)
+        {
+            var allTypes = new FilteredElementCollector(doc)
+                .OfClass(typeof(FloorType))
+                .Cast<FloorType>()
+                .ToList();
+
+            if (allTypes.Count == 0)
+                return ElementId.InvalidElementId;
+
+            // Separate regular floors from structural foundations
+            var regularFloors = new List<FloorType>();
+            var foundations = new List<FloorType>();
+
+            foreach (var ft in allTypes)
+            {
+                // Check the category of the FloorType
+                // Structural Foundation types have category OST_StructuralFoundation
+                bool isFoundation = false;
+                try
+                {
+                    if (ft.Category != null &&
+                        ft.Category.Id.Equals(
+                            new ElementId(BuiltInCategory.OST_StructuralFoundation)))
+                    {
+                        isFoundation = true;
+                    }
+                }
+                catch { }
+
+                // Also check by name keywords as fallback
+                if (!isFoundation)
+                {
+                    string name = ft.Name ?? "";
+                    string famName = "";
+                    try { famName = ft.FamilyName ?? ""; } catch { }
+                    string combined = name + " " + famName;
+                    if (combined.IndexOf("Foundation", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        combined.IndexOf("Structural", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        isFoundation = true;
+                    }
+                }
+
+                if (isFoundation)
+                    foundations.Add(ft);
+                else
+                    regularFloors.Add(ft);
+            }
+
+            // Use regular floors if available
+            var candidates = regularFloors.Count > 0 ? regularFloors : allTypes;
+
+            // 1. Prefer "Generic" type
+            var generic = candidates.FirstOrDefault(t =>
+                t.Name.IndexOf("Generic", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (generic != null) return generic.Id;
+
+            // 2. First regular floor
+            return candidates[0].Id;
         }
 
         /// <summary>
@@ -645,6 +1037,52 @@ namespace FloorRoofTopo
             // Roof: Base Offset From Level
             p = element.get_Parameter(BuiltInParameter.ROOF_LEVEL_OFFSET_PARAM);
             if (p != null && p.HasValue) return p.AsDouble();
+
+            return 0;
+        }
+
+        /// <summary>
+        /// Get the thickness of an element from its type's CompoundStructure.
+        /// Works for Floor, Roof, and similar layered elements.
+        /// Returns 0 if thickness cannot be determined.
+        /// </summary>
+        public static double GetElementThickness(Document doc, Element element)
+        {
+            if (element == null) return 0;
+            try
+            {
+                ElementId typeId = element.GetTypeId();
+                if (typeId == null || typeId == ElementId.InvalidElementId) return 0;
+
+                Element typeElem = doc.GetElement(typeId);
+
+                // Try RoofType
+                RoofType roofType = typeElem as RoofType;
+                if (roofType != null)
+                {
+                    CompoundStructure cs = roofType.GetCompoundStructure();
+                    if (cs != null) return cs.GetWidth();
+                }
+
+                // Try FloorType
+                FloorType floorType = typeElem as FloorType;
+                if (floorType != null)
+                {
+                    CompoundStructure cs = floorType.GetCompoundStructure();
+                    if (cs != null) return cs.GetWidth();
+                }
+            }
+            catch { }
+
+            // Fallback: try ROOF/FLOOR_ATTR_THICKNESS_PARAM
+            try
+            {
+                Parameter p = element.get_Parameter(BuiltInParameter.ROOF_ATTR_THICKNESS_PARAM);
+                if (p != null && p.HasValue) return p.AsDouble();
+                p = element.get_Parameter(BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM);
+                if (p != null && p.HasValue) return p.AsDouble();
+            }
+            catch { }
 
             return 0;
         }
@@ -737,119 +1175,272 @@ namespace FloorRoofTopo
         /// causing DrawPoint to create new points instead of modifying
         /// existing corner/edge vertices.
         /// 
-        /// The algorithm uses two passes:
+        /// The algorithm uses three passes:
         ///   Pass 1: Match source points to existing target vertices by XY
-        ///           proximity and modify them using DrawPoint with the
-        ///           target vertex's EXACT XY coordinates.
-        ///   Pass 2: Add remaining unmatched source points (interior points)
-        ///           as new points.
+        ///           proximity and modify them using target vertex's EXACT XY.
+        ///           If a point fails, it is NOT marked as matched so Pass 2
+        ///           can retry with the source's original XY coordinates.
+        ///   Pass 2: Retry failed + unmatched source points using their
+        ///           original XY coordinates (DrawPoint handles matching).
+        ///   Pass 3: Final fallback — try DrawPoint-first for any remaining
+        ///           unapplied points (handles Revit version API differences).
         /// </summary>
         public static int ApplyShapePointsAdjusted(
-            Element element, List<ShapePointData> shapeData, double targetBaseZ)
+            Element element, List<ShapePointData> shapeData, double targetBaseZ,
+            ConversionDiagnosticInfo diag = null)
         {
             if (shapeData == null || shapeData.Count == 0) return 0;
 
             SlabShapeEditor editor = GetEditor(element);
-            if (editor == null) return 0;
+            if (editor == null)
+            {
+                if (diag != null) diag.EditorMethods = "GetEditor returned null";
+                return 0;
+            }
 
             if (!editor.IsEnabled)
+            {
                 editor.Enable();
+                try { element.Document.Regenerate(); } catch { }
 
-            // ── CRITICAL: Regenerate to initialize editor vertices ───────
-            // Without this, the vertex list may be empty after Enable(),
-            // causing vertex matching to fail completely.
-            try { element.Document.Regenerate(); }
-            catch { }
-
-            // ── Collect existing target vertices (corners + edges) ────────
-            var existingVertices = new List<XYZ>();
-            try
-            {
-                foreach (SlabShapeVertex v in editor.SlabShapeVertices)
+                editor = GetEditor(element);
+                if (editor == null)
                 {
-                    existingVertices.Add(v.Position);
-                }
-            }
-            catch { }
-
-            // Track which existing vertices and source points have been matched
-            var matchedExisting = new bool[existingVertices.Count];
-            var matchedSource = new bool[shapeData.Count];
-
-            int applied = 0;
-
-            // ── Pass 1: Match source points to existing target vertices ──
-            // For each existing target vertex, find the closest source point.
-            // This ensures ALL target vertices get processed (not just those
-            // that happen to match a source point in the reverse direction).
-            for (int ev = 0; ev < existingVertices.Count; ev++)
-            {
-                var targetVtx = existingVertices[ev];
-                int bestSrcIdx = -1;
-                double bestDist = 0.5; // ~150mm tolerance for cross-type matching
-
-                for (int si = 0; si < shapeData.Count; si++)
-                {
-                    if (matchedSource[si]) continue;
-
-                    double dx = targetVtx.X - shapeData[si].X;
-                    double dy = targetVtx.Y - shapeData[si].Y;
-                    double dist = Math.Sqrt(dx * dx + dy * dy);
-
-                    if (dist < bestDist)
-                    {
-                        bestDist = dist;
-                        bestSrcIdx = si;
-                    }
+                    if (diag != null) diag.EditorMethods = "GetEditor returned null after Enable+Regen";
+                    return 0;
                 }
 
-                if (bestSrcIdx >= 0)
+                // Retry once if still not enabled
+                if (!editor.IsEnabled)
                 {
-                    var data = shapeData[bestSrcIdx];
-                    double adjustedZ = targetBaseZ + data.RelativeZ;
-                    data.TargetZ = adjustedZ;
-
-                    // Use target vertex's EXACT XY → DrawPoint recognizes it
-                    XYZ adjustedPoint = new XYZ(targetVtx.X, targetVtx.Y, adjustedZ);
-
                     try
                     {
-                        if (AddPointSafe(editor, adjustedPoint))
-                        {
-                            data.Applied = true;
-                            applied++;
-                        }
+                        editor.Enable();
+                        element.Document.Regenerate();
+                        editor = GetEditor(element);
                     }
                     catch { }
+                }
 
-                    matchedExisting[ev] = true;
-                    matchedSource[bestSrcIdx] = true;
+                // On Revit 2026+, IsEnabled may remain False even after
+                // Enable() in a separate committed transaction.
+                // Do NOT bail out — proceed anyway and try AddPoint/ModifySubElement.
+                // These operations may work despite IsEnabled reporting False.
+                if (editor == null)
+                {
+                    if (diag != null) diag.EditorMethods = "GetEditor null after retries";
+                    return 0;
                 }
             }
 
-            // ── Pass 2: Add remaining unmatched source points ────────────
-            // These are interior points that don't have a corresponding
-            // existing target vertex. Add them as new points.
+            // Regenerate to ensure vertices are fully initialized
+            try { element.Document.Regenerate(); } catch { }
+            editor = GetEditor(element);
+            if (editor == null)
+            {
+                if (diag != null) diag.EditorMethods = "GetEditor null after final regen";
+                return 0;
+            }
+
+            // ── Discover available methods for diagnostics ────────────────
+            if (diag != null)
+            {
+                diag.EditorMethods = GetEditorMethodsSummary(editor);
+            }
+
+            int applied = 0;
+            _lastPointError = null;
+
+            // ── Helper: collect vertices from editor ─────────────────────
+            Func<List<SlabShapeVertex>> collectVertices = () =>
+            {
+                var verts = new List<SlabShapeVertex>();
+                try
+                {
+                    foreach (SlabShapeVertex v in editor.SlabShapeVertices)
+                        verts.Add(v);
+                }
+                catch { }
+                return verts;
+            };
+
+            // ── Helper: match and modify vertices against source data ────
+            // Returns number of newly applied points.
+            Func<List<SlabShapeVertex>, double, int> matchAndModify = (verts, tolerance) =>
+            {
+                int count = 0;
+                foreach (var vtx in verts)
+                {
+                    XYZ vPos = vtx.Position;
+                    int bestSrcIdx = -1;
+                    double bestDist = tolerance;
+
+                    for (int si = 0; si < shapeData.Count; si++)
+                    {
+                        if (shapeData[si].Applied) continue;
+                        double dx = vPos.X - shapeData[si].X;
+                        double dy = vPos.Y - shapeData[si].Y;
+                        double dist = Math.Sqrt(dx * dx + dy * dy);
+                        if (dist < bestDist) { bestDist = dist; bestSrcIdx = si; }
+                    }
+
+                    if (bestSrcIdx < 0) continue;
+
+                    var data = shapeData[bestSrcIdx];
+                    double offset = data.RelativeZ;
+                    data.TargetZ = targetBaseZ + offset;
+
+                    if (Math.Abs(offset) < 1e-9)
+                    {
+                        data.Applied = true;
+                        count++;
+                        continue;
+                    }
+
+                    if (ModifyVertexSafe(editor, vtx, offset))
+                    {
+                        data.Applied = true;
+                        count++;
+                    }
+                    else
+                    {
+                        data.ErrorInfo = _lastPointError;
+                    }
+                }
+                return count;
+            };
+
+            // ── Pass 1: Modify existing vertices (corners) ──────────────
+            var existingVerts = collectVertices();
+            applied += matchAndModify(existingVerts, 0.5);
+
+            // ── Pass 1b: Regenerate and match NEW auto-generated vertices ─
+            // After modifying corner vertices, Revit may auto-create edge
+            // vertices along the boundary. Regenerate + re-collect to match
+            // source edge points to these new vertices.
+            if (applied > 0 && applied < shapeData.Count)
+            {
+                try { element.Document.Regenerate(); } catch { }
+                editor = GetEditor(element);
+                if (editor != null)
+                {
+                    var newVerts = collectVertices();
+                    if (newVerts.Count > existingVerts.Count)
+                    {
+                        applied += matchAndModify(newVerts, 0.5);
+                    }
+                }
+            }
+
+            // ── Pass 2: Add remaining points via DrawPoint/AddPoint ─────
+            // For points with no matching vertex (interior or edge points
+            // not auto-generated), create them via DrawPoint/AddPoint.
+            if (editor == null) editor = GetEditor(element);
             for (int si = 0; si < shapeData.Count; si++)
             {
-                if (matchedSource[si]) continue;
-
+                if (shapeData[si].Applied) continue;
                 var data = shapeData[si];
-                double adjustedZ = targetBaseZ + data.RelativeZ;
-                data.TargetZ = adjustedZ;
-
-                XYZ adjustedPoint = new XYZ(data.X, data.Y, adjustedZ);
+                double offset = data.RelativeZ;
+                data.TargetZ = targetBaseZ + offset;
 
                 try
                 {
-                    if (AddPointSafe(editor, adjustedPoint))
+                    XYZ facePoint = new XYZ(data.X, data.Y, targetBaseZ);
+                    if (AddPointSafe(editor, facePoint))
                     {
                         data.Applied = true;
                         applied++;
+
+                        if (Math.Abs(offset) > 1e-9)
+                        {
+                            try { element.Document.Regenerate(); } catch { }
+                            editor = GetEditor(element);
+                            if (editor != null)
+                            {
+                                foreach (SlabShapeVertex v in editor.SlabShapeVertices)
+                                {
+                                    double vdx = v.Position.X - data.X;
+                                    double vdy = v.Position.Y - data.Y;
+                                    if (Math.Sqrt(vdx * vdx + vdy * vdy) < 0.01)
+                                    {
+                                        ModifyVertexSafe(editor, v, offset);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        data.ErrorInfo = _lastPointError;
                     }
                 }
                 catch { }
             }
+
+#if REVIT2026
+            // ── Revit 2026 Fallback: Try AddPoint with absolute Z ───────
+            // On Revit 2026, SlabShapeEditor.Enable() may not work for
+            // newly created elements. As a fallback, try AddPoint with
+            // the ABSOLUTE desired Z coordinate (not face Z).
+            // Revit 2026's AddPoint may accept absolute coordinates and
+            // compute the offset internally, unlike old DrawPoint which
+            // required the point to be ON the slab face.
+            if (applied == 0)
+            {
+                // Re-acquire editor in case previous attempts changed state
+                editor = GetEditor(element);
+                if (editor != null)
+                {
+                    // Try Enable one more time before the fallback
+                    if (!editor.IsEnabled)
+                    {
+                        try { editor.Enable(); } catch { }
+                        try { element.Document.Regenerate(); } catch { }
+                        editor = GetEditor(element);
+                    }
+
+                    if (editor != null)
+                    {
+                        for (int si = 0; si < shapeData.Count; si++)
+                        {
+                            if (shapeData[si].Applied) continue;
+                            var data = shapeData[si];
+                            double desiredZ = targetBaseZ + data.RelativeZ;
+                            data.TargetZ = desiredZ;
+
+                            // Strategy A: AddPoint with absolute Z
+                            try
+                            {
+                                XYZ absPoint = new XYZ(data.X, data.Y, desiredZ);
+                                editor.AddPoint(absPoint);
+                                data.Applied = true;
+                                applied++;
+                                continue;
+                            }
+                            catch (Exception ex)
+                            {
+                                data.ErrorInfo = $"AddPoint(absZ): {ex.GetType().Name}: {ex.Message}";
+                            }
+
+                            // Strategy B: AddPoint with offset as Z
+                            try
+                            {
+                                XYZ offsetPoint = new XYZ(data.X, data.Y, data.RelativeZ);
+                                editor.AddPoint(offsetPoint);
+                                data.Applied = true;
+                                applied++;
+                                continue;
+                            }
+                            catch (Exception ex)
+                            {
+                                data.ErrorInfo = $"AddPoint(offsetZ): {ex.GetType().Name}: {ex.Message}";
+                            }
+                        }
+                    }
+                }
+            }
+#endif
 
             return applied;
         }
@@ -998,6 +1589,20 @@ namespace FloorRoofTopo
                     ExtractShapePointsDetailed(source, diag.SourceBaseZ);
                 diag.ShapePoints = shapeData;
 
+                // ── 2b. Subdivide boundary at edge vertex positions ─────
+                // Edge vertices lie ON boundary edges. SlabShapeEditor cannot
+                // add new points on edges — only modify existing vertices.
+                // By splitting boundary curves at edge positions, each edge
+                // point becomes a corner vertex on the target element.
+                if (shapeData.Count > 0 && target != ConvertTarget.TopoSolid)
+                {
+                    try
+                    {
+                        boundary = SubdivideBoundaryAtEdgePoints(boundary, shapeData);
+                    }
+                    catch { /* Keep original boundary if subdivision fails */ }
+                }
+
                 // ── 3. Create target element ────────────────────────────
                 Element newElement = null;
                 switch (target)
@@ -1011,16 +1616,50 @@ namespace FloorRoofTopo
                     case ConvertTarget.TopoSolid:
 #if REVIT2024_PLUS
                         {
-                            // For TopoSolid: pass shape points directly during creation
-                            // This is more reliable than post-creation SlabShapeEditor
+                            // For TopoSolid: pass shape points directly during creation.
+                            // CRITICAL: TopoSolid does NOT have "Height Offset From Level"
+                            // parameter, so we must bake the source offset into:
+                            //   1. Boundary Z (surfaceElevation = sourceBaseZ)
+                            //   2. Interior point Z (adjZ = sourceBaseZ + relativeZ)
                             var topoPoints = new List<XYZ>();
-                            double topoBaseZ = diag.LevelElevation;
+                            double topoBaseZ = diag.SourceBaseZ;
                             foreach (var sp in shapeData)
                             {
                                 double adjZ = topoBaseZ + sp.RelativeZ;
                                 topoPoints.Add(new XYZ(sp.X, sp.Y, adjZ));
                             }
-                            newElement = CreateTopoSolid(doc, boundary, levelId, topoPoints);
+
+                            // If no shape points but source has offset,
+                            // generate a centroid point at sourceBaseZ.
+                            // This forces Toposolid.Create to respect the
+                            // surface elevation (some Revit versions ignore boundary Z).
+                            if (topoPoints.Count == 0 && Math.Abs(diag.SourceOffset) > 1e-9)
+                            {
+                                double cx = 0, cy = 0;
+                                int ptCount = 0;
+                                foreach (var loop in boundary)
+                                {
+                                    foreach (Curve c in loop)
+                                    {
+                                        XYZ p = c.GetEndPoint(0);
+                                        cx += p.X;
+                                        cy += p.Y;
+                                        ptCount++;
+                                    }
+                                }
+                                if (ptCount > 0)
+                                {
+                                    cx /= ptCount;
+                                    cy /= ptCount;
+                                    topoPoints.Add(new XYZ(cx, cy, topoBaseZ));
+                                }
+                            }
+
+                            // Pass sourceBaseZ as surfaceElevation so boundary is
+                            // flattened to the correct absolute Z (not just levelZ)
+                            newElement = CreateTopoSolid(doc, boundary, levelId,
+                                topoPoints.Count > 0 ? topoPoints : null,
+                                diag.SourceBaseZ);
                         }
 #else
                         result.ErrorMessage =
@@ -1052,22 +1691,66 @@ namespace FloorRoofTopo
                 double targetBaseZ = GetBaseElevation(doc, newElement);
                 diag.TargetBaseZ = targetBaseZ;
 
+                // ── 5b. For TopoSolid target: override base Z ────────────
+                // TopoSolid has NO "Height Offset From Level" parameter,
+                // so SetHeightOffset (step 7) will do nothing.
+                // We must bake the source offset into the Z math here:
+                //   adjustedZ = sourceBaseZ + relativeZ = original absolute Z
+                // For Floor/Roof targets, keep using targetBaseZ because
+                // step 7 will apply the offset via the parameter.
+                double shapeBaseZ = targetBaseZ;
+#if REVIT2024_PLUS
+                if (target == ConvertTarget.TopoSolid)
+                {
+                    shapeBaseZ = diag.SourceBaseZ;
+                }
+#endif
+
                 // ── 6. Apply shape points with Z adjustment ─────────────
-                // Points are applied at: targetBaseZ + relativeOffset
-                // This ensures correct relative deformation regardless of
-                // source height offset.
+                // Try applying within this transaction first.
+                // If Enable fails (Revit 2026+), store data for phase 2.
                 if (shapeData.Count > 0)
                 {
                     try
                     {
                         int applied = ApplyShapePointsAdjusted(
-                            newElement, shapeData, targetBaseZ);
+                            newElement, shapeData, shapeBaseZ, diag);
                         diag.AppliedCount = applied;
 
                         if (applied < shapeData.Count)
                         {
-                            result.WarningMessage =
-                                $"Đã áp dụng {applied}/{shapeData.Count} điểm nhấc.";
+                            // Check if editor couldn't be enabled (Revit 2026+)
+                            // If so, defer to phase 2 (separate transaction)
+                            bool editorFailed = diag.EditorMethods != null &&
+                                diag.EditorMethods.Contains("Enabled=False");
+
+                            if (editorFailed && applied == 0)
+                            {
+                                // Store for phase 2 — separate transaction
+                                // Reset Applied flags for retry
+                                foreach (var sp in shapeData)
+                                {
+                                    sp.Applied = false;
+                                    sp.ErrorInfo = null;
+                                }
+                                result.HasPendingShapeEditing = true;
+                                result.PendingShapeData = shapeData;
+                                result.PendingShapeBaseZ = shapeBaseZ;
+                            }
+                            else
+                            {
+                                var errors = shapeData
+                                    .Where(sp => !sp.Applied && !string.IsNullOrEmpty(sp.ErrorInfo))
+                                    .Select(sp => sp.ErrorInfo)
+                                    .Distinct()
+                                    .Take(3)
+                                    .ToList();
+                                string errDetail = errors.Count > 0
+                                    ? " | " + string.Join("; ", errors)
+                                    : "";
+                                result.WarningMessage =
+                                    $"Đã áp dụng {applied}/{shapeData.Count} điểm nhấc{errDetail}";
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -1081,9 +1764,31 @@ namespace FloorRoofTopo
                 // After shape points are applied relative to levelZ,
                 // setting the offset shifts the entire element (including
                 // shape deformations) to match source absolute positions.
-                if (Math.Abs(diag.SourceOffset) > 1e-9)
+                // NOTE: Skip for TopoSolid — it has no offset parameter,
+                // and the offset was already baked into shape points (step 5b/6).
+                if (target != ConvertTarget.TopoSolid)
                 {
-                    SetHeightOffset(newElement, diag.SourceOffset);
+                    double finalOffset = diag.SourceOffset;
+
+                    // ── Roof thickness compensation ─────────────────────
+                    // Roof reference plane is at the BOTTOM. Top = bottom + thickness.
+                    // To align roof TOP surface with source surface (TopoSolid/Floor),
+                    // we must shift the roof DOWN by its thickness.
+                    // TopoSolid → Roof: offset = 0 - thickness = -thickness
+                    // Floor → Roof:     offset = sourceOffset - thickness
+                    if (target == ConvertTarget.Roof)
+                    {
+                        double roofThickness = GetElementThickness(doc, newElement);
+                        if (roofThickness > 1e-9)
+                        {
+                            finalOffset -= roofThickness;
+                        }
+                    }
+
+                    if (Math.Abs(finalOffset) > 1e-9)
+                    {
+                        SetHeightOffset(newElement, finalOffset);
+                    }
                 }
 
                 // ── 8. Delete source if requested ───────────────────────
@@ -1105,6 +1810,79 @@ namespace FloorRoofTopo
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Enable SlabShapeEditor on an element.
+        /// Must be called inside its own Transaction and committed
+        /// BEFORE attempting to modify vertices (Revit 2026+ requirement).
+        /// </summary>
+        public static void EnableShapeEditor(Element element)
+        {
+            if (element == null) return;
+
+            SlabShapeEditor editor = GetEditor(element);
+            if (editor == null) return;
+
+            if (!editor.IsEnabled)
+            {
+                editor.Enable();
+            }
+        }
+
+        /// <summary>
+        /// Apply pending shape points AFTER the editor has been enabled
+        /// in a separate committed transaction.
+        /// Called in Phase 3 (Revit 2026+) or Phase 2 (older versions).
+        /// Must be called inside a Transaction.
+        /// </summary>
+        public static void ApplyPendingShapeEditing(Document doc, ConversionResult result)
+        {
+            if (!result.HasPendingShapeEditing) return;
+            if (result.PendingShapeData == null || result.PendingShapeData.Count == 0) return;
+            if (result.NewElementId == null || result.NewElementId == ElementId.InvalidElementId) return;
+
+            Element element = doc.GetElement(result.NewElementId);
+            if (element == null) return;
+
+            var diag = result.Diagnostics;
+
+            try
+            {
+                try { doc.Regenerate(); } catch { }
+
+                int applied = ApplyShapePointsAdjusted(
+                    element, result.PendingShapeData, result.PendingShapeBaseZ, diag);
+
+                if (diag != null)
+                    diag.AppliedCount = applied;
+
+                if (applied < result.PendingShapeData.Count)
+                {
+                    var errors = result.PendingShapeData
+                        .Where(sp => !sp.Applied && !string.IsNullOrEmpty(sp.ErrorInfo))
+                        .Select(sp => sp.ErrorInfo)
+                        .Distinct()
+                        .Take(3)
+                        .ToList();
+                    string errDetail = errors.Count > 0
+                        ? " | " + string.Join("; ", errors)
+                        : "";
+                    result.WarningMessage =
+                        $"Phase 2: {applied}/{result.PendingShapeData.Count} điểm nhấc{errDetail}";
+                }
+                else
+                {
+                    // Clear warning — all points applied successfully
+                    result.WarningMessage = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                result.WarningMessage = $"Phase 2 error: {ex.Message}";
+            }
+
+            result.HasPendingShapeEditing = false;
         }
     }
 }

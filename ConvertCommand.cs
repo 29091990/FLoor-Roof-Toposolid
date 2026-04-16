@@ -91,6 +91,9 @@ namespace FloorRoofTopo
                 List<string> messages = new List<string>();
                 List<ConversionDiagnosticInfo> allDiagnostics = new List<ConversionDiagnosticInfo>();
 
+                // ── Phase 1: Create elements ────────────────────────────────
+                List<ConversionResult> allResults = new List<ConversionResult>();
+
                 using (Transaction tx = new Transaction(doc, "Convert Floor/Roof/Topo"))
                 {
                     tx.Start();
@@ -99,6 +102,8 @@ namespace FloorRoofTopo
                     {
                         ConversionResult result =
                             ConversionEngine.Convert(doc, elem, target, deleteSource);
+
+                        allResults.Add(result);
 
                         if (result.Success)
                         {
@@ -127,6 +132,61 @@ namespace FloorRoofTopo
                     else
                     {
                         tx.Commit();
+                    }
+                }
+
+                // ── Phase 2: Apply pending shape editing ─────────────────────
+                // On Revit 2026+, SlabShapeEditor.Enable() fails within the
+                // same transaction as element creation. After committing the
+                // creation transaction, the editor can now be enabled.
+                bool hasPending = false;
+                foreach (var r in allResults)
+                    if (r.HasPendingShapeEditing) { hasPending = true; break; }
+
+                if (hasPending)
+                {
+                    // ── Phase 2: Enable SlabShapeEditor ─────────────────
+                    try { doc.Regenerate(); } catch { }
+                    try { uidoc.RefreshActiveView(); } catch { }
+
+                    using (Transaction tx2 = new Transaction(doc, "Enable Shape Editor"))
+                    {
+                        tx2.Start();
+
+                        foreach (var r in allResults)
+                        {
+                            if (!r.HasPendingShapeEditing) continue;
+                            if (r.NewElementId == null || r.NewElementId == ElementId.InvalidElementId) continue;
+
+                            Element elem = doc.GetElement(r.NewElementId);
+                            if (elem == null) continue;
+
+                            ConversionEngine.EnableShapeEditor(elem);
+                        }
+
+                        tx2.Commit();
+                    }
+
+                    // ── Phase 3: Apply shape points ─────────────────────
+                    try { doc.Regenerate(); } catch { }
+                    try { uidoc.RefreshActiveView(); } catch { }
+
+                    using (Transaction tx3 = new Transaction(doc, "Apply Shape Points"))
+                    {
+                        tx3.Start();
+
+                        foreach (var r in allResults)
+                        {
+                            if (!r.HasPendingShapeEditing) continue;
+                            ConversionEngine.ApplyPendingShapeEditing(doc, r);
+
+                            if (!string.IsNullOrEmpty(r.WarningMessage))
+                            {
+                                messages.Add("⚠ " + r.WarningMessage);
+                            }
+                        }
+
+                        tx3.Commit();
                     }
                 }
 
